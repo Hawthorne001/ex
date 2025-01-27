@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -77,10 +78,10 @@ func TestDownloader_Download(t *testing.T) {
 			URL:    url.URL{Path: "/test/file-1.txt"},
 			Header: http.Header{
 				"Accept-Encoding": {"gzip"},
-				"User-Agent":      {"Go-http-client/1.1"},
+				"User-Agent":      {"CircleCI (downloader, ex)"},
 			},
 			Body: []byte(""),
-		}}, ignoreHoneyCombHeader)
+		}}, ignoreO11yCombHeaders)
 	})
 
 	url2 := server.URL + "/test/file-2.txt"
@@ -98,10 +99,10 @@ func TestDownloader_Download(t *testing.T) {
 			URL:    url.URL{Path: "/test/file-2.txt"},
 			Header: http.Header{
 				"Accept-Encoding": {"gzip"},
-				"User-Agent":      {"Go-http-client/1.1"},
+				"User-Agent":      {"CircleCI (downloader, ex)"},
 			},
 			Body: []byte(""),
-		}}, ignoreHoneyCombHeader)
+		}}, ignoreO11yCombHeaders)
 	})
 
 	t.Run("Cached download", func(t *testing.T) {
@@ -113,7 +114,7 @@ func TestDownloader_Download(t *testing.T) {
 		assert.Check(t, strings.HasSuffix(target, filepath.Join("test", "file-2.txt")))
 		assertFileContents(t, target, "Second compressed file")
 
-		assert.DeepEqual(t, recorder.AllRequests(), originalRequests, ignoreHoneyCombHeader)
+		assert.DeepEqual(t, recorder.AllRequests(), originalRequests, ignoreO11yCombHeaders)
 	})
 
 	t.Run("Remove cached and re-download", func(t *testing.T) {
@@ -137,10 +138,10 @@ func TestDownloader_Download(t *testing.T) {
 			URL:    url.URL{Path: "/test/file-2.txt"},
 			Header: http.Header{
 				"Accept-Encoding": {"gzip"},
-				"User-Agent":      {"Go-http-client/1.1"},
+				"User-Agent":      {"CircleCI (downloader, ex)"},
 			},
 			Body: []byte(""),
-		}}, ignoreHoneyCombHeader)
+		}}, ignoreO11yCombHeaders)
 	})
 
 	t.Run("Not found", func(t *testing.T) {
@@ -154,10 +155,10 @@ func TestDownloader_Download(t *testing.T) {
 			URL:    url.URL{Path: "/test/file-3.txt"},
 			Header: http.Header{
 				"Accept-Encoding": {"gzip"},
-				"User-Agent":      {"Go-http-client/1.1"},
+				"User-Agent":      {"CircleCI (downloader, ex)"},
 			},
 			Body: []byte(""),
-		}}, ignoreHoneyCombHeader)
+		}}, ignoreO11yCombHeaders)
 	})
 
 	t.Run("remote downloads", func(t *testing.T) {
@@ -194,6 +195,81 @@ func TestDownloader_Download(t *testing.T) {
 	})
 }
 
+func TestDownloader_AttemptTimeout(t *testing.T) {
+	recorder := httprecorder.New()
+
+	mu := sync.Mutex{}
+	pathAttempts := map[string]int{
+		"/test/slow.txt": 0,
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		err := recorder.Record(r)
+		if err != nil {
+			panic(err)
+		}
+
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Content-Type", "application/octet-stream")
+
+		zw := gzip.NewWriter(w)
+		defer zw.Close()
+
+		switch r.URL.Path {
+		case "/test/slow.txt":
+			mu.Lock()
+			defer mu.Unlock()
+			if pathAttempts[r.URL.Path] == 0 {
+				time.Sleep(5 * time.Second)
+			}
+			pathAttempts[r.URL.Path]++
+			w.WriteHeader(http.StatusOK)
+			_, _ = fmt.Fprint(zw, "First compressed file")
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	ctx := testcontext.Background()
+
+	dir, err := os.MkdirTemp("", "e2e-test")
+	assert.Assert(t, err)
+
+	d, err := NewDownloader(10*time.Second, dir,
+		AttemptTimeout(4*time.Second))
+	assert.Assert(t, err)
+	defer func() {
+		assert.Assert(t, os.RemoveAll(dir))
+	}()
+
+	t.Run("Slow Download", func(t *testing.T) {
+		target, err := d.Download(ctx, server.URL+"/test/slow.txt", 0644)
+
+		assert.NilError(t, err)
+		assert.Check(t, strings.HasSuffix(target, filepath.Join("test", "slow.txt")))
+		assertFileContents(t, target, "First compressed file")
+
+		requests := recorder.FindRequests("GET", url.URL{Path: "/test/slow.txt"})
+		assert.DeepEqual(t, requests, []httprecorder.Request{{
+			Method: "GET",
+			URL:    url.URL{Path: "/test/slow.txt"},
+			Header: http.Header{
+				"Accept-Encoding": {"gzip"},
+				"User-Agent":      {"CircleCI (downloader, ex)"},
+			},
+			Body: []byte(""),
+		}, {
+			Method: "GET",
+			URL:    url.URL{Path: "/test/slow.txt"},
+			Header: http.Header{
+				"Accept-Encoding": {"gzip"},
+				"User-Agent":      {"CircleCI (downloader, ex)"},
+			},
+			Body: []byte(""),
+		}}, ignoreO11yCombHeaders)
+	})
+}
+
 func assertFileContents(t *testing.T, path, contents string) {
 	t.Helper()
 
@@ -211,6 +287,6 @@ func assertFileContents(t *testing.T, path, contents string) {
 	assert.Check(t, cmp.Equal(string(b), contents))
 }
 
-var ignoreHoneyCombHeader = cmpopts.IgnoreMapEntries(func(key string, values []string) bool {
-	return key == "X-Honeycomb-Trace"
+var ignoreO11yCombHeaders = cmpopts.IgnoreMapEntries(func(key string, values []string) bool {
+	return key == "X-Honeycomb-Trace" || key == "Traceparent" || key == "Tracestate"
 })

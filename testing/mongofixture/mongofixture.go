@@ -5,14 +5,14 @@ package mongofixture
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"math/rand"
 	"strings"
 	"testing"
 
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"gotest.tools/v3/assert"
 
 	"github.com/circleci/ex/o11y"
@@ -37,7 +37,7 @@ func Setup(ctx context.Context, t testing.TB, con Connection) *Fixture {
 		ApplyURI(con.URI).
 		SetAppName("test")
 
-	client, err := mongo.Connect(ctx, opts)
+	client, err := mongo.Connect(opts)
 	assert.Assert(t, err)
 
 	t.Cleanup(func() {
@@ -62,7 +62,8 @@ func Setup(ctx context.Context, t testing.TB, con Connection) *Fixture {
 
 func randomSuffix() string {
 	bytes := make([]byte, 3)
-	//#nosec:G404 - this is just a name for a test database
+	//#nosec:G404 - this is just a name for a test database // this #nosec was being ignored by golangci-lint 1.57.1,
+	// and I couldn't figure out why, so I just replaced this with crypto/rand. :party-shrug:
 	if _, err := rand.Read(bytes); err != nil {
 		return "not-random--i-hope-thats-ok"
 	}

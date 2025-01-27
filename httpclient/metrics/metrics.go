@@ -222,7 +222,8 @@ type con struct {
 //nolint:funlen
 func (r *request) gotCon(info httptrace.GotConnInfo) {
 	if r.con == nil {
-		panic("cant have gotCon after getCon")
+		o11y.AddField(r.ctx, "req.got_conn.no_con", true)
+		return // rather than panic, just don't capture metrics for this request
 	}
 	r.conDoneAt = time.Now()
 

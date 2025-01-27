@@ -22,52 +22,292 @@ import (
 	"gotest.tools/v3/assert"
 	"gotest.tools/v3/assert/cmp"
 
+	o11yconfig "github.com/circleci/ex/config/o11y"
 	"github.com/circleci/ex/httpclient"
 	"github.com/circleci/ex/httpclient/dnscache"
 	"github.com/circleci/ex/httpserver"
 	"github.com/circleci/ex/httpserver/ginrouter"
 	"github.com/circleci/ex/o11y"
+	"github.com/circleci/ex/o11y/otel"
 	"github.com/circleci/ex/o11y/wrappers/o11ynethttp"
+	"github.com/circleci/ex/testing/fakestatsd"
 	"github.com/circleci/ex/testing/httprecorder"
+	"github.com/circleci/ex/testing/jaeger"
 	"github.com/circleci/ex/testing/testcontext"
 )
 
 func TestClient_Call_Propagates(t *testing.T) {
-	ctx := testcontext.Background()
 	traceIDChan := make(chan string, 1)
 	defer close(traceIDChan)
 
-	helpers := o11y.FromContext(ctx).Helpers()
+	t.Run("hc-propagation", func(t *testing.T) {
+		ctx := testcontext.Background()
 
-	okHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		traceID, _ := helpers.TraceIDs(r.Context())
-		traceIDChan <- traceID
+		okHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			helpers := o11y.FromContext(ctx).Helpers()
+			traceID, _ := helpers.TraceIDs(r.Context())
+			traceIDChan <- traceID
+			span := o11y.FromContext(r.Context()).GetSpan(r.Context())
+			span.AddField("prov_get_span", true)
+		})
+
+		server := httptest.NewServer(o11ynethttp.Middleware(o11y.FromContext(ctx), "name", okHandler))
+		client := httpclient.New(httpclient.Config{
+			Name:    "hc-test",
+			BaseURL: server.URL,
+			Timeout: time.Second,
+		})
+
+		helpers := o11y.FromContext(ctx).Helpers()
+
+		ctx, span := o11y.StartSpan(ctx, "test client span")
+		err := client.Call(ctx, httpclient.NewRequest("POST", "/"))
+		assert.Check(t, err)
+		span.End()
+
+		httpClientTraceID, _ := helpers.TraceIDs(ctx)
+
+		t.Logf("httpClientTraceID: %q", httpClientTraceID)
+		assert.Check(t, cmp.Equal(httpClientTraceID, <-traceIDChan))
+
+		t.Run("no-propagation", func(t *testing.T) {
+			err := client.Call(ctx, httpclient.NewRequest("POST", "/", httpclient.Propagation(false)))
+			assert.Check(t, err)
+
+			// assert a new traceID was created in the server
+			assert.Check(t, httpClientTraceID != <-traceIDChan)
+		})
 	})
 
-	server := httptest.NewServer(o11ynethttp.Middleware(o11y.FromContext(ctx), "name", okHandler))
-	client := httpclient.New(httpclient.Config{
-		Name:    "name",
-		BaseURL: server.URL,
-		Timeout: time.Second,
+	t.Run("both otel propagation", func(t *testing.T) {
+		op, err := otel.New(otel.Config{})
+		assert.NilError(t, err)
+		ctx := o11y.WithProvider(context.Background(), op)
+
+		okHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			helpers := op.Helpers()
+			traceID, _ := helpers.TraceIDs(r.Context())
+			traceIDChan <- traceID
+			span := o11y.FromContext(r.Context()).GetSpan(r.Context())
+			span.AddField("prov_get_span", true)
+			b := o11y.GetBaggage(r.Context())
+			assert.Check(t, cmp.Equal(b["test_baggage"], "bag value"))
+		})
+
+		server := httptest.NewServer(o11ynethttp.Middleware(op, "name", okHandler))
+		client := httpclient.New(httpclient.Config{
+			Name:    "otel-test",
+			BaseURL: server.URL,
+			Timeout: time.Second,
+		})
+
+		helpers := o11y.FromContext(ctx).Helpers()
+
+		ctx, span := o11y.StartSpan(ctx, "new client span")
+		ctx = o11y.WithBaggage(ctx, o11y.Baggage{
+			"test_baggage": "bag value",
+		})
+		err = client.Call(ctx, httpclient.NewRequest("POST", "/"))
+		assert.Check(t, err)
+		span.End()
+
+		httpClientTraceID, _ := helpers.TraceIDs(ctx)
+
+		t.Logf("httpClientTraceID: %q", httpClientTraceID)
+		assert.Check(t, cmp.Equal(httpClientTraceID, <-traceIDChan))
 	})
-	req := httpclient.NewRequest("POST", "/")
 
-	ctx, span := o11y.StartSpan(ctx, "test client span")
-	err := client.Call(ctx, req)
-	assert.Check(t, err)
-	span.End()
+	t.Run("hc server accepts otel client propagation", func(t *testing.T) {
+		srvCtx := testcontext.Background()
+		srvProvider := o11y.FromContext(srvCtx)
 
-	httpClientTraceID, _ := helpers.TraceIDs(ctx)
+		okHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			helpers := srvProvider.Helpers()
+			traceID, _ := helpers.TraceIDs(r.Context())
+			traceIDChan <- traceID
+			span := o11y.FromContext(r.Context()).GetSpan(r.Context())
+			span.AddField("prov_get_span", true)
+		})
 
-	t.Logf("httpClientTraceID: %q", httpClientTraceID)
-	assert.Check(t, cmp.Equal(httpClientTraceID, <-traceIDChan))
+		server := httptest.NewServer(o11ynethttp.Middleware(srvProvider, "name", okHandler))
+		client := httpclient.New(httpclient.Config{
+			Name:    "otel-test",
+			BaseURL: server.URL,
+			Timeout: time.Second,
+		})
 
-	t.Run("no-propagation", func(t *testing.T) {
-		err := client.Call(ctx, httpclient.NewRequest("POST", "/", httpclient.Propagation(false)))
+		// Client Side stuff
+		op, err := otel.New(otel.Config{})
+		assert.NilError(t, err)
+		ctx := o11y.WithProvider(context.Background(), op)
+
+		helpers := op.Helpers()
+
+		ctx, span := o11y.StartSpan(ctx, "new client span")
+		err = client.Call(ctx, httpclient.NewRequest("POST", "/"))
+		assert.Check(t, err)
+		span.End()
+
+		httpClientTraceID, _ := helpers.TraceIDs(ctx)
+
+		t.Logf("httpClientTraceID: %q", httpClientTraceID)
+		assert.Check(t, cmp.Equal(httpClientTraceID, <-traceIDChan))
+	})
+
+	t.Run("hc client propagates to otel server", func(t *testing.T) {
+		srvProvider, err := otel.New(otel.Config{})
+		assert.NilError(t, err)
+
+		okHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			helpers := srvProvider.Helpers()
+			traceID, _ := helpers.TraceIDs(r.Context())
+			traceIDChan <- traceID
+			span := o11y.FromContext(r.Context()).GetSpan(r.Context())
+			span.AddField("prov_get_span", true)
+		})
+
+		server := httptest.NewServer(o11ynethttp.Middleware(srvProvider, "name", okHandler))
+		client := httpclient.New(httpclient.Config{
+			Name:    "otel-test",
+			BaseURL: server.URL,
+			Timeout: time.Second,
+		})
+
+		// Client Side stuff
+		ctx := testcontext.Background()
+		op := o11y.FromContext(ctx)
+		helpers := op.Helpers()
+
+		ctx, span := o11y.StartSpan(ctx, "new client span")
+		err = client.Call(ctx, httpclient.NewRequest("POST", "/"))
+		assert.Check(t, err)
+		span.End()
+
+		httpClientTraceID, _ := helpers.TraceIDs(ctx)
+
+		t.Logf("httpClientTraceID: %q", httpClientTraceID)
+		assert.Check(t, cmp.Equal(httpClientTraceID, <-traceIDChan))
+	})
+
+	t.Run("hc client w3c disabled", func(t *testing.T) {
+		srvProvider, err := otel.New(otel.Config{})
+		assert.NilError(t, err)
+
+		okHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			helpers := srvProvider.Helpers()
+			traceID, _ := helpers.TraceIDs(r.Context())
+			traceIDChan <- traceID
+			span := o11y.FromContext(r.Context()).GetSpan(r.Context())
+			span.AddField("prov_get_span", true)
+		})
+
+		server := httptest.NewServer(o11ynethttp.Middleware(srvProvider, "name", okHandler))
+		client := httpclient.New(httpclient.Config{
+			Name:                       "otel-test",
+			BaseURL:                    server.URL,
+			Timeout:                    time.Second,
+			DisableW3CTracePropagation: true,
+		})
+
+		// Client Side stuff
+		ctx := testcontext.Background()
+		op := o11y.FromContext(ctx)
+		helpers := op.Helpers()
+
+		ctx, span := o11y.StartSpan(ctx, "new client span")
+		err = client.Call(ctx, httpclient.NewRequest("POST", "/"))
+		assert.Check(t, err)
+		span.End()
+
+		httpClientTraceID, _ := helpers.TraceIDs(ctx)
+
+		// The server trace id should be different from the client one
+		assert.Check(t, httpClientTraceID != <-traceIDChan)
+	})
+
+	t.Run("propagate flatten", func(t *testing.T) {
+		start := time.Now()
+		s := fakestatsd.New(t)
+		ctx := testcontext.Background()
+
+		ctx, closeProvider, err := o11yconfig.Otel(ctx, o11yconfig.OtelConfig{
+			Dataset:         "propagate-flatten",
+			GrpcHostAndPort: "127.0.0.1:4317",
+			Service:         "app-main",
+			Version:         "dev-test",
+			Statsd:          s.Addr(),
+			StatsNamespace:  "test-app",
+		})
+
+		assert.NilError(t, err)
+
+		okHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, span := o11y.StartSpan(r.Context(), "h-span")
+			span.AddField("prov_get_span", true)
+		})
+
+		server := httptest.NewServer(o11ynethttp.Middleware(o11y.FromContext(ctx), "name", okHandler))
+		client := httpclient.New(httpclient.Config{
+			Name:    "otel-test",
+			BaseURL: server.URL,
+			Timeout: time.Second,
+		})
+
+		ctx, span := o11y.StartSpan(ctx, "new client span")
+
+		err = client.Call(ctx, httpclient.NewRequest("POST", "/", httpclient.Flatten("tcl")))
 		assert.Check(t, err)
 
-		// assert a new traceID was created in the server
-		assert.Check(t, httpClientTraceID != <-traceIDChan)
+		span.End()
+
+		// Should flush to jaeger
+		closeProvider(ctx)
+
+		jc := jaeger.New("http://localhost:16686", "app-main")
+		traces, err := jc.Traces(ctx, start)
+		assert.NilError(t, err)
+		assert.Assert(t, cmp.Len(traces, 1))
+
+		spans := traces[0].Spans
+		// only one span - no httpcl or http server spans
+		assert.Check(t, cmp.Equal(len(spans), 1))
+
+		js := spans[0]
+		assert.Check(t, cmp.Equal(js.OperationName, "new client span"))
+
+		expected := map[string]bool{
+			"service":                             true,
+			"version":                             true,
+			"hc_tcl.meta.type":                    true,
+			"hc_tcl.http.url":                     true,
+			"hc_tcl.http.request_content_length":  true,
+			"hc_tcl.http.base_url":                true,
+			"hc_tcl.http.target":                  true,
+			"hc_tcl.http.retry":                   true,
+			"hc_tcl.result":                       true,
+			"hc_tcl.flattened":                    true,
+			"hc_tcl.http.client_name":             true,
+			"hc_tcl.duration_ms":                  true,
+			"hc_tcl.http.attempt":                 true,
+			"hc_tcl.http.user_agent":              true,
+			"hc_tcl.http.response_content_length": true,
+			"hc_tcl.http.status_code":             true,
+			"hc_tcl.http.route":                   true,
+			"hc_tcl.http.scheme":                  true,
+			"hc_tcl.http.host":                    true,
+			"hc_tcl.http.method":                  true,
+			"span.kind":                           true,
+			"internal.span.format":                true,
+
+			// N.B. these are added by the jaegertracing/all-in-one:latest image. If you see different results than CI,
+			// it's best to do a docker-compose pull to ensure you're using the latest image.
+			"otel.scope.name": true,
+		}
+
+		assert.Check(t, cmp.Len(js.Tags, len(expected)))
+		for _, tag := range js.Tags {
+			assert.Check(t, expected[tag.Key], "%q not expected", tag.Key)
+		}
 	})
 }
 
@@ -301,6 +541,66 @@ func TestClient_Call_Timeouts(t *testing.T) {
 				assert.Check(t, err)
 			} else {
 				assert.Check(t, errors.Is(err, tt.wantError), err.Error())
+			}
+		})
+	}
+}
+
+func TestClient_Call_MaxElapsedTime(t *testing.T) {
+	okHandler := func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}
+	retriedHandler := func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(500)
+	}
+
+	tests := []struct {
+		name           string
+		handler        func(w http.ResponseWriter, r *http.Request)
+		maxElapsedTime time.Duration
+		wantStatusCode int
+	}{
+		{
+			name:    "good response",
+			handler: okHandler,
+		},
+		{
+			name:           "maxElapsedTime error",
+			handler:        retriedHandler,
+			maxElapsedTime: 200 * time.Millisecond,
+			wantStatusCode: 500,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := testcontext.Background()
+			server := httptest.NewServer(http.HandlerFunc(tt.handler))
+			client := httpclient.New(httpclient.Config{
+				Name:    tt.name,
+				BaseURL: server.URL,
+				Timeout: 30 * time.Second,
+			})
+
+			start := time.Now()
+			perRequestTimeout := 50 * time.Millisecond
+			err := client.Call(ctx, httpclient.NewRequest("POST", "/",
+				httpclient.MaxElapsedTime(tt.maxElapsedTime),
+				httpclient.Timeout(perRequestTimeout),
+			))
+
+			if tt.wantStatusCode == 0 {
+				assert.NilError(t, err)
+			} else {
+				httpErr := &httpclient.HTTPError{}
+				// Checking we have a HTTPError proves we aren't hitting the per req timeout as that results in a
+				// context.DeadlineExceeded
+				assert.Check(t, errors.As(err, &httpErr))
+				assert.Check(t, httpclient.HasStatusCode(err, tt.wantStatusCode))
+
+				// Check the timings are in bounds makes sure we aren't hitting the clients set timeout
+				assert.Check(t, time.Since(start) <= tt.maxElapsedTime)
+				assert.Check(t, time.Since(start) > perRequestTimeout)
 			}
 		})
 	}

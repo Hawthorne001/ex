@@ -35,7 +35,7 @@ func shouldSample(determinant string, rate int) bool {
 		return true
 	}
 
-	threshold := math.MaxUint32 / uint32(rate)
+	threshold := math.MaxUint32 / uint32(rate) //nolint:gosec
 	v := crc32.ChecksumIEEE([]byte(determinant))
 
 	return v < threshold
