@@ -2,13 +2,16 @@ package otel
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/circleci/ex/o11y"
 )
 
-func extractAndSendMetrics(mp o11y.MetricsProvider) func([]o11y.Metric, map[string]interface{}) {
-	return func(metrics []o11y.Metric, fields map[string]interface{}) {
+func extractAndSendMetrics(mp o11y.MetricsProvider) func([]o11y.Metric, map[string]any) {
+	return func(metrics []o11y.Metric, fields map[string]any) {
+
+		standardErrorMetrics(mp, fields)
 
 		for _, m := range metrics {
 			tags := extractTagsFromFields(m.TagFields, fields)
@@ -54,7 +57,41 @@ func extractAndSendMetrics(mp o11y.MetricsProvider) func([]o11y.Metric, map[stri
 	}
 }
 
-func extractTagsFromFields(tags []string, fields map[string]interface{}) []string {
+func standardErrorMetrics(mp o11y.MetricsProvider, fields map[string]any) {
+	// detect and map the fail same errors and add a metric for it if found
+	failClass := addFailure(fields)
+	if failClass != "" {
+		_ = mp.Count("failure", 1, []string{fmtTag("class", failClass)}, 1)
+	}
+	// add standard metric for error and warning
+	tag := []string{fmtTag("type", "o11y")}
+	if _, ok := fields["error"]; ok {
+		_ = mp.Count("error", 1, tag, 1)
+	}
+	if _, ok := fields["warning"]; ok {
+		_ = mp.Count("warning", 1, tag, 1)
+	}
+}
+
+// addFailure finds the first field suffixed with _error and adds the prefix as the value
+// to a failure field, if there is not already a failure field, and returns the prefix.
+// The original _error field is kept to retain details of its value.
+// If found the prefix part is returned.
+func addFailure(fields map[string]any) string {
+	if _, ok := fields["failure"]; ok {
+		return ""
+	}
+	for k := range fields {
+		errClass := strings.TrimSuffix(k, "_error")
+		if errClass != k {
+			fields["failure"] = errClass
+			return errClass
+		}
+	}
+	return ""
+}
+
+func extractTagsFromFields(tags []string, fields map[string]any) []string {
 	result := make([]string, 0, len(tags))
 	for _, name := range tags {
 		val, ok := getField(name, fields)
@@ -65,7 +102,7 @@ func extractTagsFromFields(tags []string, fields map[string]interface{}) []strin
 	return result
 }
 
-func getField(name string, fields map[string]interface{}) (interface{}, bool) {
+func getField(name string, fields map[string]any) (any, bool) {
 	val, ok := fields[name]
 	if !ok {
 		// Also support the app. prefix, for interop with honeycomb's prefixed fields
@@ -74,7 +111,7 @@ func getField(name string, fields map[string]interface{}) (interface{}, bool) {
 	return val, ok
 }
 
-func toInt64(val interface{}) (int64, bool) {
+func toInt64(val any) (int64, bool) {
 	switch v := val.(type) {
 	case int64:
 		return v, true
@@ -84,7 +121,7 @@ func toInt64(val interface{}) (int64, bool) {
 	return 0, false
 }
 
-func toFloat64(val interface{}) (float64, bool) {
+func toFloat64(val any) (float64, bool) {
 	if i, ok := val.(float64); ok {
 		return i, true
 	}
@@ -94,7 +131,7 @@ func toFloat64(val interface{}) (float64, bool) {
 	return 0, false
 }
 
-func toMilliSecond(val interface{}) (float64, bool) {
+func toMilliSecond(val any) (float64, bool) {
 	if f, ok := toFloat64(val); ok {
 		return f, true
 	}
@@ -109,6 +146,6 @@ func toMilliSecond(val interface{}) (float64, bool) {
 	return float64(d.Milliseconds()), true
 }
 
-func fmtTag(name string, val interface{}) string {
+func fmtTag(name string, val any) string {
 	return fmt.Sprintf("%s:%v", name, val)
 }

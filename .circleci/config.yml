@@ -2,9 +2,9 @@ version: 2.1
 
 x-data:
   go_versions: &go_versions
-    - '1.20'
     - '1.21'
     - '1.22'
+    - '1.23'
 
 workflows:
   main:
@@ -62,14 +62,14 @@ jobs:
           POSTGRES_USER: user
           POSTGRES_PASSWORD: password
           POSTGRES_DB: dbname
-      - image: cimg/redis:7.2
+      - image: cimg/redis:7.4
         command: [
           "redis-server",
           "--protected-mode", "no",
           "--databases", "1000000",
         ]
-      - image: rabbitmq:3.13-management-alpine
-      - image: mongo:7.0
+      - image: rabbitmq:4.0-management-alpine
+      - image: mongo:8.0
         environment:
           MONGO_INITDB_ROOT_USERNAME: root
           MONGO_INITDB_ROOT_PASSWORD: password
@@ -92,7 +92,7 @@ jobs:
           '/datanv',
           '--address', ':9124',
         ]
-      - image: hashicorp/vault:1.15.6
+      - image: hashicorp/vault:1.18.4
         environment:
           SKIP_SETCAP: skip
           VAULT_DEV_ROOT_TOKEN_ID: dummyroot

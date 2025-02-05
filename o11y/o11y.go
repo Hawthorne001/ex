@@ -10,10 +10,12 @@ import (
 	"net/http"
 	"net/url"
 	"runtime/debug"
+	"strconv"
 	"strings"
 
 	"github.com/DataDog/datadog-go/statsd"
 	"github.com/rollbar/rollbar-go"
+	"go.opentelemetry.io/otel/baggage"
 )
 
 type Provider interface {
@@ -32,9 +34,10 @@ type Provider interface {
 	//
 	//   ctx, span := o11y.StartSpan(ctx, "GET /help")
 	//   defer span.End()
-	StartSpan(ctx context.Context, name string) (context.Context, Span)
+	// Opts are generally expected to be set by other ex packages, rather than application code
+	StartSpan(ctx context.Context, name string, opts ...SpanOpt) (context.Context, Span)
 
-	// GetSpan returns the currently active span
+	// GetSpan returns the active span in the given context. It will return nil if there is no span available.
 	GetSpan(ctx context.Context) Span
 
 	// AddField is for adding application-level information to the currently active span
@@ -57,8 +60,12 @@ type Provider interface {
 	// MetricsProvider grants lower control over the metrics that o11y sends, allowing skipping spans.
 	MetricsProvider() MetricsProvider
 
-	// Helpers returns some specific helper functions
-	Helpers() Helpers
+	// Helpers returns some specific helper functions. Temporary optional param during the cutover to otel
+	Helpers(disableW3c ...bool) Helpers
+
+	// MakeSpanGolden Add a golden span from the span currently in the context.
+	// If the golden trace does not exist it will be started.
+	MakeSpanGolden(ctx context.Context) context.Context
 }
 
 // PropagationContext contains trace context values that are propagated from service to service.
@@ -69,19 +76,15 @@ type PropagationContext struct {
 	// Parent contains single string serialisation of just the trace parent fields
 	Parent string
 	// Headers contains the map of all context propagation headers
-	Headers map[string]string
+	Headers http.Header
 }
 
 // PropagationContextFromHeader is a helper constructs a PropagationContext from h. It is not filtered
 // to the headers needed for propagation. It is expected to be used as the input to InjectPropagation.
 func PropagationContextFromHeader(h http.Header) PropagationContext {
-	p := PropagationContext{
-		Headers: map[string]string{},
+	return PropagationContext{
+		Headers: h,
 	}
-	for k := range h {
-		p.Headers[k] = h.Get(k)
-	}
-	return p
 }
 
 type Helpers interface {
@@ -89,9 +92,12 @@ type Helpers interface {
 	ExtractPropagation(ctx context.Context) PropagationContext
 	// InjectPropagation adds propagation header fields into the returned root span returning
 	// the context carrying that span
-	InjectPropagation(context.Context, PropagationContext) (context.Context, Span)
-	// TraceIDs return standard o11y ids
+	InjectPropagation(context.Context, PropagationContext, ...SpanOpt) (context.Context, Span)
+
+	// TraceIDs return standard o11y ids - used for testing
 	TraceIDs(ctx context.Context) (traceID, parentID string)
+	// GoldenTraceID returns the golden trace id - for testing
+	//GoldenTraceID(ctx context.Context) string
 }
 
 type Span interface {
@@ -111,6 +117,9 @@ type Span interface {
 
 	// RecordMetric tells the provider to emit a metric to its metric backend when the span ends
 	RecordMetric(metric Metric)
+
+	// Flatten causes all child span attributes to be set on this span, with the given prefix
+	Flatten(prefix string)
 
 	// End sets the duration of the span and tells the related provider that the span is complete,
 	// so it can do its appropriate processing. The span should not be used after End is called.
@@ -228,8 +237,8 @@ func LogError(ctx context.Context, name string, err error, fields ...Pair) {
 }
 
 // StartSpan starts a span from a context that must contain a provider for this to have any effect.
-func StartSpan(ctx context.Context, name string) (context.Context, Span) {
-	return FromContext(ctx).StartSpan(ctx, name)
+func StartSpan(ctx context.Context, name string, opts ...SpanOpt) (context.Context, Span) {
+	return FromContext(ctx).StartSpan(ctx, name, opts...)
 }
 
 // AddField adds a field to the currently active span
@@ -240,6 +249,12 @@ func AddField(ctx context.Context, key string, val interface{}) {
 // AddFieldToTrace adds a field to the currently active root span and all of its current and future child spans
 func AddFieldToTrace(ctx context.Context, key string, val interface{}) {
 	FromContext(ctx).AddFieldToTrace(ctx, key, val)
+}
+
+// MakeSpanGolden Add a golden span from the span currently in the context.
+// If the golden trace does not exist it will be started.
+func MakeSpanGolden(ctx context.Context) context.Context {
+	return FromContext(ctx).MakeSpanGolden(ctx)
 }
 
 // End completes a span, including using AddResultToSpan to set the error and result fields
@@ -298,6 +313,9 @@ type Baggage map[string]string
 func (b Baggage) addToTrace(ctx context.Context) {
 	o := FromContext(ctx)
 	for k, v := range b {
+		if isInternalBaggage(k) {
+			continue
+		}
 		k := strings.ReplaceAll(k, "-", "_")
 		o.AddFieldToTrace(ctx, k, v)
 	}
@@ -305,45 +323,71 @@ func (b Baggage) addToTrace(ctx context.Context) {
 
 type baggageKey struct{}
 
-func WithBaggage(ctx context.Context, baggage Baggage) context.Context {
-	baggage.addToTrace(ctx)
-	return context.WithValue(ctx, baggageKey{}, baggage)
+func WithBaggage(ctx context.Context, b Baggage) context.Context {
+	bg := baggage.FromContext(ctx)
+	for k, v := range b {
+		m, err := baggage.NewMemberRaw(k, v)
+		if err != nil {
+			AddField(ctx, "baggage_error", err)
+			continue
+		}
+		bg, err = bg.SetMember(m)
+		if err != nil {
+			AddField(ctx, "baggage_error", err)
+		}
+	}
+	ctx = baggage.ContextWithBaggage(ctx, bg)
+	b.addToTrace(ctx)
+	return context.WithValue(ctx, baggageKey{}, b)
 }
 
 func GetBaggage(ctx context.Context) Baggage {
+	rbg := Baggage{}
+	bg := baggage.FromContext(ctx)
+	for _, m := range bg.Members() {
+		rbg[m.Key()] = m.Value()
+		// N.B. baggage properties not supported
+	}
+
 	b, ok := ctx.Value(baggageKey{}).(Baggage)
 	if !ok {
-		return Baggage{}
+		return rbg
 	}
-	return b
+	for k, v := range b {
+		rbg[k] = v
+	}
+	return rbg
 }
 
 var defaultProvider = &noopProvider{}
 
 type noopProvider struct{}
 
-func (c *noopProvider) AddGlobalField(key string, val interface{}) {}
+func (c *noopProvider) AddGlobalField(string, interface{}) {}
 
-func (c *noopProvider) StartSpan(ctx context.Context, name string) (context.Context, Span) {
+func (c *noopProvider) StartSpan(ctx context.Context, _ string, _ ...SpanOpt) (context.Context, Span) {
 	return ctx, &noopSpan{}
 }
-func (c *noopProvider) GetSpan(ctx context.Context) Span {
+
+func (c *noopProvider) MakeSpanGolden(ctx context.Context) context.Context { return ctx }
+
+func (c *noopProvider) GetSpan(context.Context) Span {
 	return &noopSpan{}
 }
 
-func (c *noopProvider) AddField(ctx context.Context, key string, val interface{}) {}
+func (c *noopProvider) AddField(context.Context, string, interface{}) {}
 
-func (c *noopProvider) AddFieldToTrace(ctx context.Context, key string, val interface{}) {}
+func (c *noopProvider) AddFieldToTrace(context.Context, string, interface{}) {}
 
-func (c *noopProvider) Close(ctx context.Context) {}
+func (c *noopProvider) Close(context.Context) {}
 
-func (c *noopProvider) Log(ctx context.Context, name string, fields ...Pair) {}
+func (c *noopProvider) Log(context.Context, string, ...Pair) {}
 
 func (c *noopProvider) MetricsProvider() MetricsProvider {
 	return &statsd.NoOpClient{}
 }
 
-func (c *noopProvider) Helpers() Helpers {
+func (c *noopProvider) Helpers(...bool) Helpers {
 	return noopHelpers{}
 }
 
@@ -353,7 +397,9 @@ func (n noopHelpers) ExtractPropagation(_ context.Context) PropagationContext {
 	return PropagationContext{}
 }
 
-func (n noopHelpers) InjectPropagation(ctx context.Context, _ PropagationContext) (context.Context, Span) {
+func (n noopHelpers) InjectPropagation(ctx context.Context,
+	_ PropagationContext, _ ...SpanOpt) (context.Context, Span) {
+
 	return ctx, &noopSpan{}
 }
 
@@ -363,13 +409,11 @@ func (n noopHelpers) TraceIDs(_ context.Context) (traceID, parentID string) {
 
 type noopSpan struct{}
 
-func (s *noopSpan) AddField(key string, val interface{}) {}
-
+func (s *noopSpan) AddField(key string, val interface{})    {}
 func (s *noopSpan) AddRawField(key string, val interface{}) {}
-
-func (s *noopSpan) RecordMetric(metric Metric) {}
-
-func (s *noopSpan) End() {}
+func (s *noopSpan) RecordMetric(metric Metric)              {}
+func (s *noopSpan) End()                                    {}
+func (s *noopSpan) Flatten(string)                          {}
 
 func HandlePanic(ctx context.Context, span Span, panic interface{}, r *http.Request) (err error) {
 	err = fmt.Errorf("panic handled: %+v", panic)
@@ -390,6 +434,52 @@ func HandlePanic(ctx context.Context, span Span, panic interface{}, r *http.Requ
 		rollbarClient.LogPanic(panic, true)
 	}
 	return err
+}
+
+const flattenDepthBaggageKey = "flatten"
+
+func ExtrasFromBaggage(ctx context.Context) (flatten int, gold http.Header) {
+	b := GetBaggage(ctx)
+	depth := 0
+	if v, ok := b[flattenDepthBaggageKey]; ok {
+		depth, _ = strconv.Atoi(v)
+	}
+	gold = http.Header{}
+	for k, v := range b {
+		gk := strings.TrimPrefix(k, goldenTracePrefix)
+		if gk != k {
+			gold.Add(gk, v)
+		}
+	}
+	return depth, gold
+}
+
+const goldenTracePrefix = "golden-"
+
+func AddExtrasToBaggage(ctx context.Context, flatten int, gold http.Header) context.Context {
+	bag := Baggage{}
+	if flatten > 0 {
+		bag[flattenDepthBaggageKey] = strconv.Itoa(flatten)
+	}
+	for k, v := range gold {
+		if len(v) > 0 {
+			bag[goldenTracePrefix+k] = v[0]
+		}
+	}
+	if len(bag) == 0 {
+		return ctx
+	}
+	return WithBaggage(ctx, bag)
+}
+
+func isInternalBaggage(key string) bool {
+	if key == flattenDepthBaggageKey {
+		return true
+	}
+	if strings.HasPrefix(key, goldenTracePrefix) {
+		return true
+	}
+	return false
 }
 
 type rollbarAble interface {
