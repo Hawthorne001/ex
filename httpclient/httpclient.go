@@ -67,6 +67,8 @@ type Config struct {
 	// (e.g. if it uses specific query params or headers when bucketing requests) but should be enabled
 	// with care as it can lead to thrashing the server if not used appropriately.
 	NoRateLimitBackoff bool
+	// DisableW3CTracePropagation is a temporary option to disable sending w3c trace propagation headers
+	DisableW3CTracePropagation bool
 }
 
 // Client is the o11y instrumented http client.
@@ -81,6 +83,8 @@ type Client struct {
 	additionalHeaders     map[string]string
 	tracer                tracer
 	noRateLimitBackoff    bool
+	// temporary - whilst we cut over to otel and a shared dataset
+	disableW3CTracePropagation bool
 
 	mu      sync.RWMutex
 	last429 time.Time
@@ -107,9 +111,11 @@ func New(cfg Config) *Client {
 	}
 
 	additionalHeaders := make(map[string]string)
-	if cfg.UserAgent != "" {
-		additionalHeaders["User-Agent"] = cfg.UserAgent
+	ua := cfg.UserAgent
+	if ua == "" {
+		ua = fmt.Sprintf("CircleCI (%s, ex)", cfg.Name)
 	}
+	additionalHeaders["User-Agent"] = ua
 
 	var roundTripper = cfg.Transport
 	if cfg.Tracer != nil {
@@ -126,9 +132,10 @@ func New(cfg Config) *Client {
 		httpClient: &http.Client{
 			Transport: roundTripper,
 		},
-		tracer:             cfg.Tracer,
-		now:                time.Now,
-		noRateLimitBackoff: cfg.NoRateLimitBackoff,
+		tracer:                     cfg.Tracer,
+		now:                        time.Now,
+		noRateLimitBackoff:         cfg.NoRateLimitBackoff,
+		disableW3CTracePropagation: cfg.DisableW3CTracePropagation,
 	}
 }
 
@@ -157,14 +164,15 @@ type Request struct {
 	body    interface{} // If set this will be sent as JSON
 	rawBody []byte      // If set this will be sent as is
 
-	decoders map[int]decoder          // If set will be used to decode the response body by http status code
-	headerFn func(header http.Header) // If set will be called with the response header
-	cookie   *http.Cookie
-	headers  map[string]string
-	timeout  time.Duration // The individual per call timeout
-	retry    bool
-	query    url.Values
-	rawquery string
+	decoders       map[int]decoder          // If set will be used to decode the response body by http status code
+	headerFn       func(header http.Header) // If set will be called with the response header
+	cookie         *http.Cookie
+	headers        map[string]string
+	timeout        time.Duration // The individual per call timeout
+	maxElapsedTime time.Duration // The total timeout for the entire request including retries
+	retry          bool
+	query          url.Values
+	rawquery       string
 
 	// We want to prevent HTTP GETs with body or rawBody due to incompatibilities with CloudFront WAF which API Infra
 	// are introducing. In order to facilitate a migration for runner we need to be able to override this. This can be
@@ -172,6 +180,7 @@ type Request struct {
 	allowGETWithBody bool
 
 	propagation bool
+	flatten     string
 
 	url string
 }
@@ -321,9 +330,19 @@ func QueryParams(params map[string]string) func(*Request) {
 // and does not take into account of retries.
 // This is different from setting the timeout field on the http client,
 // which is the total timeout across all retries.
+// To override the total time use MaxElapsedTime
 func Timeout(timeout time.Duration) func(*Request) {
 	return func(r *Request) {
 		r.timeout = timeout
+	}
+}
+
+// MaxElapsedTime sets the overall maximum time a retryable request will execute for,
+// This overrides the timeout field on the http client for this request.
+// To set a per-attempt timeout use Timeout
+func MaxElapsedTime(maxElapsedTime time.Duration) func(*Request) {
+	return func(r *Request) {
+		r.maxElapsedTime = maxElapsedTime
 	}
 }
 
@@ -339,6 +358,13 @@ func NoRetry() func(*Request) {
 func Propagation(propagation bool) func(*Request) {
 	return func(r *Request) {
 		r.propagation = propagation
+	}
+}
+
+// Flatten marks the span for this request to be flattened into its parent
+func Flatten(prefix string) func(*Request) {
+	return func(r *Request) {
+		r.flatten = prefix
 	}
 }
 
@@ -436,10 +462,13 @@ func (c *Client) retryRequest(ctx context.Context, name string, r Request, newRe
 	attemptCounter := 0
 
 	attempt := func() (err error) {
-		ctx, span := o11y.StartSpan(ctx, name)
+		ctx, span := o11y.StartSpan(ctx, name, o11y.WithSpanKind(o11y.SpanKindClient))
 		defer o11y.End(span, &err)
 		before := time.Now()
 
+		if r.flatten != "" {
+			span.Flatten("hc_" + r.flatten)
+		}
 		attemptCounter++
 
 		if c.shouldBackoff() {
@@ -538,6 +567,10 @@ func (c *Client) retryRequest(ctx context.Context, name string, r Request, newRe
 	bo := backoff.NewExponentialBackOff()
 	bo.InitialInterval = time.Millisecond * 50
 	bo.MaxElapsedTime = c.backOffMaxElapsedTime
+	if r.maxElapsedTime > 0 {
+		bo.MaxElapsedTime = r.maxElapsedTime
+	}
+
 	return backoff.Retry(attempt, backoff.WithContext(bo, ctx))
 }
 
@@ -546,9 +579,9 @@ func (c *Client) addPropagationHeader(ctx context.Context, req *http.Request) {
 	if p == nil {
 		return
 	}
-	propagation := p.Helpers().ExtractPropagation(ctx)
+	propagation := p.Helpers(c.disableW3CTracePropagation).ExtractPropagation(ctx)
 	for k, v := range propagation.Headers {
-		req.Header.Set(k, v)
+		req.Header[k] = v
 	}
 }
 
@@ -575,7 +608,6 @@ func (r Request) decodeBody(resp *http.Response, success bool) error {
 
 func addReqToSpan(span o11y.Span, req *http.Request, attempt int) {
 	span.AddRawField("meta.type", "http_client")
-	span.AddRawField("span.kind", "Client")
 	span.AddRawField("http.scheme", req.URL.Scheme)
 	span.AddRawField("http.host", req.URL.Host)
 	span.AddRawField("http.target", req.URL.Path)
@@ -596,6 +628,12 @@ func addRespToSpan(span o11y.Span, res *http.Response) {
 	}
 	if ce := res.Header.Get("Content-Encoding"); ce != "" {
 		span.AddRawField("http.response_content_encoding", ce)
+	}
+	if rID := res.Header.Get("x-amz-request-id"); rID != "" {
+		span.AddRawField("http.amz_request_id", rID)
+	}
+	if rID2 := res.Header.Get("x-amz-id-2"); rID2 != "" {
+		span.AddRawField("http.amz_id_2", rID2)
 	}
 	span.AddRawField("http.status_code", res.StatusCode)
 }
