@@ -4,7 +4,6 @@ Package download helps download releases of binaries.
 package download
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -14,17 +13,23 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
+
 	"github.com/circleci/ex/closer"
 	"github.com/circleci/ex/httpclient"
 	"github.com/circleci/ex/o11y"
 )
 
 type Downloader struct {
-	dir    string
-	client *httpclient.Client
+	dir                    string
+	client                 *httpclient.Client
+	downloadTimeout        time.Duration
+	downloadAttemptTimeout time.Duration
 }
 
-func NewDownloader(timeout time.Duration, dir string) (*Downloader, error) {
+type Option func(d *Downloader)
+
+func NewDownloader(timeout time.Duration, dir string, options ...Option) (*Downloader, error) {
 	dir, err := filepath.Abs(dir)
 	if err != nil {
 		return nil, fmt.Errorf("could not absolutify downloader dir: %w", err)
@@ -35,12 +40,26 @@ func NewDownloader(timeout time.Duration, dir string) (*Downloader, error) {
 		return nil, fmt.Errorf("could not create e2e-test dir: %w", err)
 	}
 
-	return &Downloader{
-		dir: dir,
+	downloader := &Downloader{
+		dir:             dir,
+		downloadTimeout: timeout,
 		client: httpclient.New(httpclient.Config{
+			Name:    "downloader",
 			Timeout: timeout,
 		}),
-	}, nil
+	}
+
+	for _, option := range options {
+		option(downloader)
+	}
+
+	return downloader, nil
+}
+
+func AttemptTimeout(timeout time.Duration) Option {
+	return func(d *Downloader) {
+		d.downloadAttemptTimeout = timeout
+	}
 }
 
 // Download downloads the file from the rawURL, to a location rooted at the location specified when constructing
@@ -129,19 +148,54 @@ func (d *Downloader) downloadFile(ctx context.Context, url, target string, perm 
 	}
 	defer closer.ErrorHandler(out, &err)
 
-	var resp []byte
-	err = d.client.Call(ctx, httpclient.NewRequest("GET", url,
-		httpclient.Timeout(30*time.Second),
-		httpclient.BytesDecoder(&resp)))
+	timeout := 30 * time.Second
+	if d.downloadAttemptTimeout != 0 {
+		timeout = d.downloadAttemptTimeout
+	}
 
+	// We've observed instances of the HTTP client hitting a context.DeadlineExceeded error whilst reading the response
+	// body in the decoder. Anywhere else in the call this would (likely) lead to the client retrying the request but, in
+	// this case, it doesn't because decoder errors are always treated as non-retryable. Therefore we wrap this HTTP call
+	// in our own retry mechanism (that only retries for context.DeadlineExceeded errors) to ensure we retry as expected
+	// in this case, also ensuring that we clear the file we're downloading to before retrying so that we have a clean
+	// slate on the retry. This retry mechanism also respects the timeout set on the HTTP client itself, so that we never
+	// retry for longer than requested by the caller.
+	download := func() error {
+		err := d.client.Call(ctx, httpclient.NewRequest("GET", url,
+			httpclient.Timeout(timeout),
+			httpclient.SuccessDecoder(func(r io.Reader) error {
+				_, err := io.Copy(out, r)
+				if err != nil {
+					return fmt.Errorf("could not write file %q: %w", target, err)
+				}
+				return nil
+			})))
+
+		if errors.Is(err, context.DeadlineExceeded) {
+			if err := d.clearFile(out); err != nil {
+				return backoff.Permanent(err)
+			}
+			return err
+		}
+
+		return backoff.Permanent(err)
+	}
+
+	bo := backoff.WithContext(backoff.NewExponentialBackOff(backoff.WithMaxElapsedTime(d.downloadTimeout)), ctx)
+	err = backoff.Retry(download, bo)
 	if err != nil {
 		return fmt.Errorf("could not get URL %q: %w", url, err)
 	}
 
-	_, err = io.Copy(out, bytes.NewBuffer(resp))
+	return nil
+}
+
+func (d *Downloader) clearFile(file *os.File) error {
+	err := file.Truncate(0)
 	if err != nil {
-		return fmt.Errorf("could not write file %q: %w", target, err)
+		return err
 	}
 
-	return nil
+	_, err = file.Seek(0, 0)
+	return err
 }

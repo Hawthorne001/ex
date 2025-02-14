@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -306,7 +307,7 @@ func (h *honeycomb) AddGlobalField(key string, val interface{}) {
 	client.AddField(key, val)
 }
 
-func (h *honeycomb) StartSpan(ctx context.Context, name string) (context.Context, o11y.Span) {
+func (h *honeycomb) StartSpan(ctx context.Context, name string, _ ...o11y.SpanOpt) (context.Context, o11y.Span) {
 	span := trace.GetSpanFromContext(ctx)
 	var newSpan *trace.Span
 	if span != nil {
@@ -323,6 +324,7 @@ func (h *honeycomb) StartSpan(ctx context.Context, name string) (context.Context
 	return ctx, WrapSpan(newSpan)
 }
 
+// GetSpan returns the active span in the given context. It will return nil if there is no span available.
 func (h *honeycomb) GetSpan(ctx context.Context) o11y.Span {
 	return WrapSpan(trace.GetSpanFromContext(ctx))
 }
@@ -357,30 +359,71 @@ func (h *honeycomb) MetricsProvider() o11y.MetricsProvider {
 	return h.metricsProvider
 }
 
-func (h *honeycomb) Helpers() o11y.Helpers {
-	return helpers{}
+func (h *honeycomb) Helpers(disableW3c ...bool) o11y.Helpers {
+	d := false
+	if len(disableW3c) > 0 {
+		d = disableW3c[0]
+	}
+	return helpers{
+		disableW3c: d,
+	}
 }
 
-type helpers struct{}
+// N.B. Golden trace will not be implemented in honeycomb provider
+func (h *honeycomb) MakeSpanGolden(ctx context.Context) context.Context { return ctx }
 
+type helpers struct {
+	disableW3c bool
+}
+
+// ExtractPropagation pulls propagation info out of the ctx and returns it to be used by other packages
+// to send trace propagate to other systems.
 func (h helpers) ExtractPropagation(ctx context.Context) o11y.PropagationContext {
 	s := trace.GetSpanFromContext(ctx)
 	if s == nil {
 		return o11y.PropagationContext{}
 	}
+
 	parent := s.SerializeHeaders()
+	headers := http.Header{
+		propagation.TracePropagationHTTPHeader: []string{parent},
+	}
+
+	if !h.disableW3c {
+		// Start sending wc3 headers as well as honeycomb headers
+		_, otelHeaders := propagation.MarshalW3CTraceContext(ctx, s.PropagationContext())
+
+		for k, v := range otelHeaders {
+			headers.Set(k, v)
+		}
+	}
+
 	return o11y.PropagationContext{
 		Parent:  parent,
-		Headers: map[string]string{propagation.TracePropagationHTTPHeader: parent},
+		Headers: headers,
 	}
 }
 
-func (h helpers) InjectPropagation(ctx context.Context, p o11y.PropagationContext) (context.Context, o11y.Span) {
+// InjectPropagation adds propagation info into the ctx from p which will have been populated by other packages
+// that receive trace propagation data from other systems.
+func (h helpers) InjectPropagation(ctx context.Context,
+	p o11y.PropagationContext, _ ...o11y.SpanOpt) (context.Context, o11y.Span) {
+
+	var prop *propagation.PropagationContext
+
 	field := p.Parent
 	if field == "" {
-		field = p.Headers[propagation.TracePropagationHTTPHeader]
+		field = p.Headers.Get(propagation.TracePropagationHTTPHeader)
 	}
-	prop, _ := propagation.UnmarshalHoneycombTraceContext(field)
+	// Use the honeycomb propagation if present, otherwise grab the w3c headers
+	if field != "" {
+		prop, _ = propagation.UnmarshalHoneycombTraceContext(field)
+	} else if !h.disableW3c {
+		_, prop, _ = propagation.UnmarshalW3CTraceContext(ctx, map[string]string{
+			propagation.TraceparentHeader: p.Headers.Get(propagation.TraceparentHeader),
+		})
+	}
+
 	ctx, tr := trace.NewTrace(ctx, prop)
 	return ctx, WrapSpan(tr.GetRootSpan())
 }
@@ -429,6 +472,10 @@ func (s *span) RecordMetric(metric o11y.Metric) {
 
 func (s *span) End() {
 	s.span.Send()
+}
+
+func (s *span) Flatten(string) {
+	// N.B. We are not implementing this feature in hc
 }
 
 func mustValidateKey(key string) {

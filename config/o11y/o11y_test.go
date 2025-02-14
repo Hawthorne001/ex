@@ -1,4 +1,4 @@
-package o11y
+package o11y_test
 
 import (
 	"bytes"
@@ -10,6 +10,7 @@ import (
 	"gotest.tools/v3/assert/cmp"
 	"gotest.tools/v3/poll"
 
+	o11yconfig "github.com/circleci/ex/config/o11y"
 	"github.com/circleci/ex/config/secret"
 	"github.com/circleci/ex/o11y"
 	"github.com/circleci/ex/o11y/honeycomb"
@@ -56,7 +57,7 @@ func TestSetup_Wiring(t *testing.T) {
 	s := fakestatsd.New(t)
 
 	ctx := context.Background()
-	ctx, cleanup, err := Setup(ctx, Config{
+	ctx, cleanup, err := o11yconfig.Setup(ctx, o11yconfig.Config{
 		Statsd:            s.Addr(),
 		RollbarToken:      "qwertyuiop",
 		RollbarDisabled:   true,
@@ -109,7 +110,7 @@ func TestSetup_Wiring(t *testing.T) {
 func TestSetup_WithWriter(t *testing.T) {
 	buf := bytes.Buffer{}
 	ctx := context.Background()
-	ctx, cleanup, err := Setup(ctx, Config{
+	ctx, cleanup, err := o11yconfig.Setup(ctx, o11yconfig.Config{
 		Writer: &buf,
 	})
 	assert.Assert(t, err)
@@ -118,4 +119,17 @@ func TestSetup_WithWriter(t *testing.T) {
 	o11y.Log(ctx, "some log output")
 
 	assert.Check(t, cmp.Contains(buf.String(), "some log output"))
+}
+
+func TestConfig_OTelSampleRates(t *testing.T) {
+	conf := o11yconfig.Config{
+		SampleRates: map[string]int{
+			"foo": 128,
+		},
+	}
+	otelSampleRates := conf.OtelSampleRates()
+
+	assert.Check(t, cmp.DeepEqual(otelSampleRates, map[string]uint{
+		"foo": uint(128),
+	}))
 }

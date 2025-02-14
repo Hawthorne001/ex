@@ -2,22 +2,43 @@ package otel
 
 import (
 	"context"
+	"net/http"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/circleci/ex/o11y"
 )
 
-type helpers struct{}
+type helpers struct {
+	p          Provider
+	disableW3c bool // temporary option whilst we have split datasets
+}
 
 // ExtractPropagation pulls propagation information out of the context
 func (h helpers) ExtractPropagation(ctx context.Context) o11y.PropagationContext {
-	m := map[string]string{}
-	otel.GetTextMapPropagator().Inject(ctx, mapCarrier(m))
+	if h.disableW3c {
+		return o11y.PropagationContext{}
+	}
+
+	// Add stuff to the baggage in the context, so it can be injected into the propagation context.
+	flattenDepth := 0
+	sp := h.p.getSpan(ctx)
+	if sp != nil {
+		flattenDepth = sp.flattenDepth
+	}
+	sm := http.Header{}
+	gs := h.p.getGolden(ctx)
+	if gs != nil {
+		otel.GetTextMapPropagator().Inject(gs.ctx, propagation.HeaderCarrier(sm))
+	}
+	ctx = o11y.AddExtrasToBaggage(ctx, flattenDepth, sm)
+
+	m := http.Header{}
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(m))
 
 	return o11y.PropagationContext{
-		// TODO support single ca.Parent
 		Headers: m,
 	}
 }
@@ -26,24 +47,35 @@ func (h helpers) ExtractPropagation(ctx context.Context) o11y.PropagationContext
 // the context carrying that span. This should always return a span. If no propagation is
 // found then a new span named root is returned. It is expected that callers of this will
 // rename the returned span.
-func (h helpers) InjectPropagation(ctx context.Context, ca o11y.PropagationContext) (context.Context, o11y.Span) {
-	p := o11y.FromContext(ctx)
-	// We need to be sure to get to the underlying raw otel provider if we want to wrap
-	// the otel spn
-	oteller, ok := p.(interface{ RawProvider() *OTel })
-	if !ok {
-		return p.StartSpan(ctx, "root")
-	}
-	op := oteller.RawProvider()
+func (h helpers) InjectPropagation(ctx context.Context,
+	ca o11y.PropagationContext, opts ...o11y.SpanOpt) (context.Context, o11y.Span) {
 
-	// TODO support single ca.Parent
-	ctx = otel.GetTextMapPropagator().Extract(ctx, mapCarrier(ca.Headers))
-	sp := trace.SpanFromContext(ctx)
-	if sp.SpanContext().IsValid() {
-		return ctx, op.wrapSpan(sp)
+	if h.disableW3c {
+		return h.p.StartSpan(ctx, "root", opts...)
 	}
-	// If there was no context propagation make a span
-	return p.StartSpan(ctx, "root")
+
+	ctx = otel.GetTextMapPropagator().Extract(ctx, propagation.HeaderCarrier(ca.Headers))
+
+	// Make a new span - the trace propagation info in the context will be used
+	// N.B we update the name of this span at the calling site.
+	ctx, sp := h.p.StartSpan(ctx, "root", opts...)
+
+	// Check if the baggage indicates this span should be flattened
+	fd, goldHeaders := o11y.ExtrasFromBaggage(ctx)
+	if fd > 0 {
+		os := h.p.getSpan(ctx)
+		os.flatten("", fd)
+	}
+	if len(goldHeaders) > 0 {
+		gCtx := otel.GetTextMapPropagator().Extract(ctx, propagation.HeaderCarrier(goldHeaders))
+		spec := &golden{
+			ctx:  gCtx,
+			span: h.p.wrapSpan("", opts, trace.SpanFromContext(gCtx), nil),
+		}
+		spec.span.AddRawField(metaGolden, true)
+		ctx = context.WithValue(ctx, goldenCtxKey{}, spec)
+	}
+	return ctx, sp
 }
 
 // TraceIDs return standard o11y ids
@@ -52,23 +84,6 @@ func (h helpers) TraceIDs(ctx context.Context) (traceID, parentID string) {
 	return sc.TraceID().String(), "" // TODO - do we ever use parent
 }
 
-type mapCarrier map[string]string
-
-// Get returns the value associated with the passed key.
-func (m mapCarrier) Get(key string) string {
-	return m[key]
-}
-
-// Set stores the key-value pair.
-func (m mapCarrier) Set(key string, value string) {
-	m[key] = value
-}
-
-// Keys lists the keys stored in this carrier.
-func (m mapCarrier) Keys() []string {
-	ks := make([]string, 0, len(m))
-	for k := range m {
-		ks = append(ks, k)
-	}
-	return ks
+func (h helpers) GoldenTraceID(_ context.Context) string {
+	return ""
 }

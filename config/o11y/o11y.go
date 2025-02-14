@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"time"
 
@@ -27,7 +28,7 @@ type Config struct {
 	HoneycombHost     string
 	HoneycombKey      secret.String
 	SampleTraces      bool
-	SampleKeyFunc     func(map[string]interface{}) string
+	SampleKeyFunc     func(map[string]any) string
 	SampleRates       map[string]int
 	Format            string
 	Version           string
@@ -40,8 +41,10 @@ type Config struct {
 	RollbarDisabled         bool
 	StatsdTelemetryDisabled bool
 	Writer                  io.Writer
+
 	// Sender allows setting a custom honeycomb sender, Typically the build-in one is preferred.
 	Sender transmission.Sender
+
 	// Metrics allows setting a custom metrics client. Typically setting Statsd/StatsNamespace is preferred
 	Metrics o11y.ClosableMetricsProvider
 }
@@ -100,7 +103,7 @@ func Setup(ctx context.Context, o Config) (context.Context, func(context.Context
 	}
 
 	if o.RollbarToken != "" {
-		client := rollbar.NewAsync(o.RollbarToken.Value(), o.RollbarEnv, o.Version, hostname, o.RollbarServerRoot)
+		client := rollbar.NewAsync(o.RollbarToken.Raw(), o.RollbarEnv, o.Version, hostname, o.RollbarServerRoot)
 		client.SetEnabled(!o.RollbarDisabled)
 		client.Message(rollbar.INFO, "Deployment")
 		o11yProvider = rollBarHoneycombProvider{
@@ -155,4 +158,23 @@ func honeyComb(o Config) (honeycomb.Config, error) {
 		Sender:        o.Sender,
 	}
 	return conf, conf.Validate()
+}
+
+func clampToUintMax(v int) uint {
+	if int64(v) >= math.MaxUint32 {
+		return math.MaxUint32 - 1
+	}
+
+	//nolint gosec:G115 // This overflow is handled above
+	return uint(v)
+}
+
+// OtelSampleRates adapts the root o11y package configured map[string]int
+// sample rates to the Otel-required map[string]uint
+func (c *Config) OtelSampleRates() map[string]uint {
+	adapted := make(map[string]uint, len(c.SampleRates))
+	for k, v := range c.SampleRates {
+		adapted[k] = clampToUintMax(v)
+	}
+	return adapted
 }
